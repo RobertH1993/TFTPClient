@@ -24,7 +24,7 @@ public:
    * @brief Start receiving a file from the remote end
    * If this function returns false an extended error message can be requested
    */
-  bool read_file(const std::string& remote_file, const std::string& local_file);
+  void read_file_async(const std::string& remote_file, const std::string& local_file);
   
   
 private:
@@ -41,8 +41,10 @@ private:
   std::array<unsigned char, 516> input_data_packet;
   
   //Used for receiving a remote file
-  std::ifstream output_file;
+  std::ofstream output_file;
   std::uint16_t output_file_current_block;
+  std::size_t output_file_received_bytes;
+  std::array<unsigned char, 4>output_file_ack_packet;
   
   //Deadlines, timeouts and retransmissions
   boost::asio::deadline_timer retransmission_timer;
@@ -52,13 +54,16 @@ private:
   
   void handle_RWQ_ACK_received(std::string local_file);
   void send_RWQ_retransmission();
+  
+  void handle_RRW_data_received(std::string local_file, std::size_t bytes_transfered);
+  void send_ack_retransmission();
 
 
   //Read file and send data block by block to server
   bool send_file_data(const std::string& local_file);
   
   //Start receiving a file from the server
-  bool get_file_data(const std::string& local_file);
+  bool get_file_data(const std::string& local_file, std::size_t bytes_transfered);
   
   //Send write or read request
   bool send_RQ_packet(const std::string& filename, bool is_write_request);
