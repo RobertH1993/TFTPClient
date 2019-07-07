@@ -153,12 +153,8 @@ bool TFTPSession::send_file_data(const std::string& local_file)
                                                 this)
                                     );
   }else{
-    std::cout << "Done transfering" << std::endl;
     input_file.close();
     input_file_current_block = 1;
-    retransmission_timer.expires_at(boost::posix_time::pos_infin);
-    retransmission_timer.cancel();
-    sock.close();
     return true;
   }
   
@@ -203,20 +199,27 @@ bool TFTPSession::get_file_data(const std::string& local_file)
 //Gets called when we get a response from the first RWQ packet that is send
 void TFTPSession::handle_RWQ_response_received(std::string local_file){
   //Turn off retransmission timer
-  retransmission_timer.expires_at(boost::posix_time::pos_infin);
+  retransmission_timer.cancel();
   number_of_retransmissions = 0;
   
   //Async receive might have ended because the socket was closed by the retransmission deadline
   if(!sock.is_open()) return;
   
   //Send the file data
-  send_file_data(local_file);
+  if(send_file_data(local_file)){
+    //Transfer is done within a single packet
+    sock.close();
+    retransmission_timer.cancel();
+    std::cout << "Done is single packet !" << std::endl;
+  }
 }
 
 //Private
 //Gets called when we send an RQ message but didnt receive a response from the server
 void TFTPSession::send_RQ_retransmission(std::string remote_file, bool is_write_request)
 {
+  //if(!sock.is_open()) return;
+  
   //We can hit this while the timer just has been increase, so check if we really timed out
   if(retransmission_timer.expires_at() <= boost::asio::deadline_timer::traits_type::now()){
     if(number_of_retransmissions >= 8){
@@ -231,14 +234,14 @@ void TFTPSession::send_RQ_retransmission(std::string remote_file, bool is_write_
     
     //Reset timer
     retransmission_timer.expires_from_now(boost::posix_time::millisec(300));
-  }
-  retransmission_timer.async_wait(boost::bind(
+    retransmission_timer.async_wait(boost::bind(
                                               &TFTPSession::send_RQ_retransmission,
                                               this,
                                               remote_file,
                                               is_write_request
                                          )
                                   );
+  }
 }
 
 //Private
@@ -258,11 +261,11 @@ void TFTPSession::send_RWQ_retransmission()
     
     //Reset timer
     retransmission_timer.expires_from_now(boost::posix_time::millisec(300));
-  }
-  retransmission_timer.async_wait(boost::bind(
+    retransmission_timer.async_wait(boost::bind(
                                               &TFTPSession::send_RWQ_retransmission,
                                               this)
                                   );
+  }
 }
 
 
@@ -277,8 +280,16 @@ void TFTPSession::handle_RWQ_ACK_received(std::string local_file)
     return;
   }
   
+  //Reset number_of_retransmissions
+  number_of_retransmissions = 0;
+  
   //Send next packet
-  send_file_data(local_file);
+  if(send_file_data(local_file)){
+    //Data transfer is done
+    sock.close();
+    retransmission_timer.cancel();
+    std::cout << "Done in multiple packets!" << std::endl;
+  }
 }
 
 
