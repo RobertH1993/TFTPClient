@@ -5,6 +5,8 @@
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/placeholders.hpp>
+#include <boost/asio/deadline_timer.hpp>
+#include <fstream>
 #include <cstdint>
 
 class TFTPSession{
@@ -16,7 +18,7 @@ public:
    * @brief Start sending a file to the remote end
    * If this function returns false an extended error message can be requested
    */
-  bool write_file(const std::string& local_file, const std::string& remote_file);
+  void write_file_async(const std::string& local_file, const std::string& remote_file);
   
   /**
    * @brief Start receiving a file from the remote end
@@ -32,8 +34,25 @@ private:
   boost::asio::ip::udp::endpoint server_endpoint;
   std::array<unsigned char, 516> rx_buffer;
   
-  //Status flag
-  bool status_of_last_operation;
+  //File transmission states
+  //Used for sending a local file out to the server
+  std::ifstream input_file;
+  std::uint16_t input_file_current_block;
+  std::array<unsigned char, 516> input_data_packet;
+  
+  //Used for receiving a remote file
+  std::ifstream output_file;
+  std::uint16_t output_file_current_block;
+  
+  //Deadlines, timeouts and retransmissions
+  boost::asio::deadline_timer retransmission_timer;
+  std::uint8_t number_of_retransmissions;
+  void handle_RWQ_response_received(std::string local_file);
+  void send_RQ_retransmission(std::string remote_file, bool is_write_request);
+  
+  void handle_RWQ_ACK_received(std::string local_file);
+  void send_RWQ_retransmission();
+
 
   //Read file and send data block by block to server
   bool send_file_data(const std::string& local_file);

@@ -1,6 +1,5 @@
 #include "TFTPSession.hpp"
 #include <exception>
-#include <fstream>
 #include <vector>
 #include <cstring>
 
@@ -11,14 +10,10 @@
 
 #if defined(_WIN32)
 //htons/noths
-//setsockopt
 #include "Winsock2.h"
 #else
 //htons/noths
 #include <arpa/inet.h>
-//setsockopt
-#include <sys/types.h>
-#include <sys/socket.h>
 #endif
 
 const std::uint16_t TFTP_OPCODE_RRQ = 1;
@@ -32,7 +27,8 @@ const std::size_t TFTP_DATA_HEADER_SIZE = 4;
 
 
 TFTPSession::TFTPSession(boost::asio::io_service& aIoService, std::string aHost) : 
-      io_service(aIoService), sock(io_service), host(aHost), status_of_last_operation(true)
+      io_service(aIoService), sock(io_service), host(aHost), retransmission_timer(io_service), number_of_retransmissions(0),
+      input_file_current_block(1), output_file_current_block(1)
 {
   //Resolve server
   boost::asio::ip::udp::resolver resolver(io_service);
@@ -48,13 +44,27 @@ TFTPSession::TFTPSession(boost::asio::io_service& aIoService, std::string aHost)
 }
 
 //Public
-bool TFTPSession::write_file(const std::string& local_file, const std::string& remote_file)
+void TFTPSession::write_file_async(const std::string& local_file, const std::string& remote_file)
 {   
   //Send write request
   send_RQ_packet(remote_file, true);
-  if(get_opcode_from_rx_buffer() != TFTP_OPCODE_ACK) return false;
+  sock.async_receive_from(
+                            boost::asio::buffer(rx_buffer),
+                            server_endpoint,
+                            boost::bind(
+                              &TFTPSession::handle_RWQ_response_received,
+                              this,
+                              local_file
+                            )
+                          );
   
-  return send_file_data(local_file);
+  //Set the retransmission_timer
+  retransmission_timer.expires_from_now(boost::posix_time::millisec(200));
+  retransmission_timer.async_wait(boost::bind(&TFTPSession::send_RQ_retransmission,
+                                              this,
+                                              local_file,
+                                              true)
+                                  );
 }
 
 //Public
@@ -99,44 +109,66 @@ bool TFTPSession::send_RQ_packet(const std::string& filename, bool is_write_requ
 
 bool TFTPSession::send_file_data(const std::string& local_file)
 {
-  //Open file
-  std::ifstream local_fp(local_file, std::ios::binary);
-  if(!local_fp.is_open()){
-    throw std::invalid_argument(std::string("Cant open local file: ") + local_file + ", Does it exists?");
+  if(!sock.is_open()) return false;
+  
+  //Open file, if it isnt already
+  if(!input_file.is_open()){
+    input_file.open(local_file, std::ios::binary);
+    if(!input_file.is_open()){
+      throw std::invalid_argument(std::string("Cant open local file: ") + local_file + ", Does it exists?");
+    }
   }
   
   //Init send buffer
-  std::array<unsigned char, (TFTP_DATA_HEADER_SIZE + TFTP_BLOCK_SIZE)> data_packet;
   std::uint16_t network_order_opcode = htons(TFTP_OPCODE_DATA);
-  data_packet[0] = static_cast<char>(network_order_opcode);
-  data_packet[1] = static_cast<char>(network_order_opcode >> 8);
+  input_data_packet[0] = static_cast<char>(network_order_opcode);
+  input_data_packet[1] = static_cast<char>(network_order_opcode >> 8);
   
-  //Send data to server
-  std::uint16_t current_block = 1;
-  while(!local_fp.eof()){
+  if(!input_file.eof()){ //Send block of data
     //Set current block
-    std::uint16_t network_order_current_block = htons(current_block);
-    data_packet[2] = static_cast<char>(network_order_current_block);
-    data_packet[3] = static_cast<char>(network_order_current_block >> 8);
+    std::uint16_t network_order_current_block = htons(input_file_current_block);
+    input_data_packet[2] = static_cast<char>(network_order_current_block);
+    input_data_packet[3] = static_cast<char>(network_order_current_block >> 8);
     
     //Read data into data_buffer, recast because STL uses chars...
-    local_fp.read(reinterpret_cast<char*>(&data_packet[TFTP_DATA_HEADER_SIZE]), TFTP_BLOCK_SIZE);
+    input_file.read(reinterpret_cast<char*>(&input_data_packet[TFTP_DATA_HEADER_SIZE]), TFTP_BLOCK_SIZE);
     
     //Send the data out
-    sock.send_to(boost::asio::buffer(data_packet, TFTP_DATA_HEADER_SIZE + local_fp.gcount()), server_endpoint);
+    sock.send_to(boost::asio::buffer(input_data_packet, TFTP_DATA_HEADER_SIZE + input_file.gcount()), server_endpoint);
     
-    //wait for ack
-    sock.receive_from(boost::asio::buffer(rx_buffer), server_endpoint);
-    if(get_opcode_from_rx_buffer() != TFTP_OPCODE_ACK) return false;
+    //wait for ack (async)
+    sock.async_receive_from(boost::asio::buffer(rx_buffer),
+                            server_endpoint,
+                            boost::bind(
+                                        &TFTPSession::handle_RWQ_ACK_received,
+                                        this,
+                                        local_file)
+                            );
     
-    current_block++;
+    input_file_current_block++;
+    
+    //Set the retransmission timer
+    retransmission_timer.expires_from_now(boost::posix_time::millisec(300));
+    retransmission_timer.async_wait(boost::bind(&TFTPSession::send_RWQ_retransmission,
+                                                this)
+                                    );
+  }else{
+    std::cout << "Done transfering" << std::endl;
+    input_file.close();
+    input_file_current_block = 1;
+    retransmission_timer.expires_at(boost::posix_time::pos_infin);
+    retransmission_timer.cancel();
+    sock.close();
+    return true;
   }
   
-  return true;
+  return false;
 }
 
 bool TFTPSession::get_file_data(const std::string& local_file)
 {
+  //Check if socket is still open
+  
   //Open output file
   std::ofstream local_fp(local_file, std::ios::binary);
   if(!local_fp.is_open()){
@@ -166,6 +198,89 @@ bool TFTPSession::get_file_data(const std::string& local_file)
   
   return true;
 }
+
+//Private
+//Gets called when we get a response from the first RWQ packet that is send
+void TFTPSession::handle_RWQ_response_received(std::string local_file){
+  //Turn off retransmission timer
+  retransmission_timer.expires_at(boost::posix_time::pos_infin);
+  number_of_retransmissions = 0;
+  
+  //Async receive might have ended because the socket was closed by the retransmission deadline
+  if(!sock.is_open()) return;
+  
+  //Send the file data
+  send_file_data(local_file);
+}
+
+//Private
+//Gets called when we send an RQ message but didnt receive a response from the server
+void TFTPSession::send_RQ_retransmission(std::string remote_file, bool is_write_request)
+{
+  //We can hit this while the timer just has been increase, so check if we really timed out
+  if(retransmission_timer.expires_at() <= boost::asio::deadline_timer::traits_type::now()){
+    if(number_of_retransmissions >= 8){
+      sock.close();
+      retransmission_timer.expires_at(boost::posix_time::pos_infin);
+      return;
+    }
+    
+    //Send retransmission
+    send_RQ_packet(remote_file, is_write_request);
+    number_of_retransmissions++;
+    
+    //Reset timer
+    retransmission_timer.expires_from_now(boost::posix_time::millisec(300));
+  }
+  retransmission_timer.async_wait(boost::bind(
+                                              &TFTPSession::send_RQ_retransmission,
+                                              this,
+                                              remote_file,
+                                              is_write_request
+                                         )
+                                  );
+}
+
+//Private
+//Gets called when we send an data packet (RWQ) but didnt receive a response from the server
+void TFTPSession::send_RWQ_retransmission()
+{
+  if(retransmission_timer.expires_at() <= boost::asio::deadline_timer::traits_type::now()){
+    if(number_of_retransmissions >= 8){
+      sock.close();
+      retransmission_timer.expires_at(boost::posix_time::pos_infin);
+      return;
+    }
+    
+    //Send retransmission
+    sock.send_to(boost::asio::buffer(input_data_packet, TFTP_DATA_HEADER_SIZE + input_file.gcount()), server_endpoint);
+    number_of_retransmissions++;
+    
+    //Reset timer
+    retransmission_timer.expires_from_now(boost::posix_time::millisec(300));
+  }
+  retransmission_timer.async_wait(boost::bind(
+                                              &TFTPSession::send_RWQ_retransmission,
+                                              this)
+                                  );
+}
+
+
+
+//Private
+//Gets called after we send a data packet to the server
+void TFTPSession::handle_RWQ_ACK_received(std::string local_file)
+{
+  //Check if we got a ACK, if not close connection
+  if(get_opcode_from_rx_buffer() != TFTP_OPCODE_ACK){
+    sock.close();
+    return;
+  }
+  
+  //Send next packet
+  send_file_data(local_file);
+}
+
 
 
 //Private

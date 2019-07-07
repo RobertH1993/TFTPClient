@@ -5,9 +5,7 @@ int main(int argc, char **argv) {
     boost::asio::io_service io_service;
     TFTPSession local(io_service, "127.0.0.1");
     
-    if(local.write_file("ls", "ls")){
-      std::cout << "[+] Succesfully send data to the server!" << std::endl;
-    }
+    local.write_file_async("ls", "ls");
     //if(local.read_file("ls", "ls.back")){
     //  std::cout << "[+] Received file back from server!" << std::endl;
     //}
